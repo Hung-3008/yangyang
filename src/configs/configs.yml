@@ -1,0 +1,137 @@
+# ============================================================
+# Video-to-fMRI Flow Matching — Configuration
+# ============================================================
+
+data:
+  base_dir: "Data"
+  features_dir: "Data/features_npy_pooled"
+  fmri_dir: "Data/fmri"
+  cache_in_memory: true
+
+  subjects:
+    - "sub-01"
+    - "sub-02"
+    - "sub-03"
+    - "sub-05"
+
+  # fMRI files per split (relative to fmri_dir/{subject}/func/)
+  fmri_files:
+    friends: "{subject}_task-friends_space-MNI152NLin2009cAsym_atlas-Schaefer18_parcel-1000Par7Net_desc-s123456_bold.h5"
+    movie10: "{subject}_task-movie10_space-MNI152NLin2009cAsym_atlas-Schaefer18_parcel-1000Par7Net_bold.h5"
+
+  fmri_dim: 1000  # Schaefer 1000 parcels
+
+  # Train/Val split
+  # Train = movie10 (all) + friends s1-s5
+  # Val   = friends s6
+  # Note: s7 has features but NO fMRI data → excluded
+  train_seasons: ["s01", "s02", "s03", "s04", "s05"]
+  val_seasons: ["s06"]
+  train_include_movie10: true
+
+  # Cửa sổ thời gian (window size)
+  # Mỗi fMRI TR sẽ dùng 31 TRs features (30 quá khứ + hiện tại)
+  window_size: 31
+
+  # How to handle fMRI runs: "first", "average", "all"
+  # movie10 has 17 tasks with both run-1 and run-2
+  fmri_run_strategy: "average"
+
+  # Normalize fMRI with z-score per parcel
+  normalize_fmri: true
+
+fusion_encoder:
+  d_model: 1024
+  num_latents: 8
+  num_layers: 4
+  nhead: 8
+  dropout: 0.1
+
+velocity_net:
+  patch_size: 20       # 1000 vùng não chunk thành 50 sequence tokens.
+  d_model: 768
+  nhead: 12
+  depth: 8
+  dropout: 0.1
+  context_dim: 1024    # Nhận context từ fusion_encoder
+
+# ============================================================
+# Modality configurations
+# ============================================================
+# Each modality extracts features from different layers.
+# We select ONE representative layer per modality.
+#
+# Naming conventions for feature files:
+#   friends: {modality}/friends/s{N}/friends_s{NN}e{NN}{a|b|c|d}.h5
+#            task_id from filename: strip "friends_" prefix
+#   movie10: {modality}/movie10/{category}/{clip_name}.h5
+#            Llama models use "movie10_" prefix, others don't
+#            task_id: strip "movie10_" prefix if present
+#
+# Feature shapes:
+#   Most: (T, D)
+#   vjepa2: (T, 1, D) → needs squeeze
+# ============================================================
+
+modalities:
+  vjepa2_avg_feat:
+    layer_key: "encoder.layernorm_avg"
+    dim: 1408
+    needs_squeeze: true   # shape (T, 1, D) → (T, D)
+
+  whisper:
+    layer_key: "layer_norm"
+    dim: 1280
+    needs_squeeze: true   # shape (T, 1, D) → (T, D)
+
+  InternVL3_14B:
+    layer_key: "language_model.model.norm"
+    dim: 5120
+    needs_squeeze: false
+
+  internvl3_8b_8bit:
+    layer_key: "language_model.model.norm"
+    dim: 3584
+    needs_squeeze: false
+
+  Llama-3.2-1B:
+    layer_key: "model.layers.15"
+    dim: 2048
+    needs_squeeze: false
+    movie10_prefix: "movie10_"  # Llama uses "movie10_" prefix in movie10 filenames
+
+  Llama-3.2-3B:
+    layer_key: "model.layers.23"
+    dim: 3072
+    needs_squeeze: false
+    movie10_prefix: "movie10_"
+
+  qwen-2-5-omni-7b:
+    layer_key: "model.norm"
+    dim: 3584
+    needs_squeeze: false
+
+  qwen2-5_3B:
+    layer_key: "model.norm"
+    dim: 2048
+    needs_squeeze: false
+
+# Total feature dim when concatenating all modalities:
+# 1408 + 1280 + 5120 + 3584 + 2048 + 3072 + 3584 + 2048 = 22144
+
+# ============================================================
+# Training / Flow Matching configuration
+# ============================================================
+training:
+  batch_size: 256
+  num_workers: 4
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  epochs: 100
+  seed: 42
+  save_dir: "checkpoints"
+  log_freq: 50
+  val_every: 5        # Run validation every N epochs
+
+flow_matching:
+  sigma: 0.0          # Xác suất nhiễu cho OT Flow Matching
