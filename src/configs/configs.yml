@@ -1,5 +1,5 @@
 # ============================================================
-# Video-to-fMRI Flow Matching — Configuration
+# Video-to-fMRI Flow Matching — Configuration (U-ViT v2)
 # ============================================================
 
 data:
@@ -40,20 +40,37 @@ data:
   # Normalize fMRI with z-score per parcel
   normalize_fmri: true
 
+# ============================================================
+# Hierarchical Fusion Encoder (replaces flat FusionEncoder)
+# ============================================================
+# Multi-level Q-Former inspired by MedSegDiff's multi-scale conditioning.
+# Each level's query set learns different abstraction level from temporal memory.
+# Total output tokens = num_levels × queries_per_level + bottleneck_queries
 fusion_encoder:
-  d_model: 1024
-  num_latents: 8
-  num_layers: 4
-  nhead: 8
-  dropout: 0.2       # Tăng từ 0.1 → 0.2 chống overfitting
+  d_model: 768              # Match U-ViT embed_dim → no projection needed
+  num_levels: 4             # = depth//2 of U-ViT, one level per encoder/decoder block
+  queries_per_level: 4      # 4 tokens per abstraction level
+  bottleneck_queries: 2     # 2 global summary tokens
+  num_temporal_layers: 2    # Self-attention layers for temporal mixing
+  num_qformer_layers: 2     # Cross-attention layers for query extraction
+  nhead: 12                 # 768/12 = 64 per head
+  dropout: 0.2
 
-velocity_net:
-  patch_size: 20       # 1000 vùng não chunk thành 50 sequence tokens.
-  d_model: 768
-  nhead: 12
-  depth: 8
-  dropout: 0.2         # Tăng từ 0.1 → 0.2 chống overfitting
-  context_dim: 1024    # Nhận context từ fusion_encoder
+# ============================================================
+# U-ViT 1D Velocity Network (replaces DiT)
+# ============================================================
+# Token-concat conditioning + long skip connections.
+# Architecture: 4 in_blocks → 1 mid_block → 4 out_blocks (with skip)
+uvit:
+  patch_size: 20            # 1000 parcels → 50 patches
+  embed_dim: 768
+  depth: 8                  # 4 encoder + 1 bottleneck + 4 decoder
+  num_heads: 12
+  mlp_ratio: 4.0
+  qkv_bias: true
+  drop_rate: 0.2
+  skip: true                # Long skip connections (core U-ViT feature)
+  use_checkpoint: false     # Gradient checkpointing (saves ~65% memory)
 
 # ============================================================
 # Modality configurations
@@ -126,15 +143,15 @@ training:
   batch_size: 256
   num_workers: 4
   learning_rate: 1.0e-4
-  weight_decay: 5.0e-3   # Tăng từ 1e-4 → 5e-3 chống overfitting
-  epochs: 300             # Tăng từ 100 → 300 cho cosine decay chậm hơn
+  weight_decay: 5.0e-3
+  epochs: 300
   seed: 42
   save_dir: "checkpoints"
   log_freq: 50
   val_every: 5            # Run validation every N epochs
 
 flow_matching:
-  sigma: 0.0              # Xác suất nhiễu cho OT Flow Matching
+  sigma: 0.0              # Deterministic OT path (no noise)
 
 # ============================================================
 # EMA (Exponential Moving Average)
