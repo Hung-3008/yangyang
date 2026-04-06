@@ -41,20 +41,25 @@ data:
   normalize_fmri: true
 
 # ============================================================
-# Hierarchical Fusion Encoder (replaces flat FusionEncoder)
+# Fusion Encoder V2 (Modality-Aware Hierarchical Conditioning)
 # ============================================================
-# Multi-level Q-Former inspired by MedSegDiff's multi-scale conditioning.
-# Each level's query set learns different abstraction level from temporal memory.
+# Key improvements over V1:
+#   A) Per-modality projections (each dim_i → d_model independently)
+#   B) Cross-modal attention (modalities interact at each timestep)
+#   C) Per-level Q-Former decoders (each level has own weights)
+#   D) Auxiliary reconstruction loss (encoder must predict fMRI)
 # Total output tokens = num_levels × queries_per_level + bottleneck_queries
 fusion_encoder:
-  d_model: 768              # Match U-ViT embed_dim → no projection needed
-  num_levels: 4             # = depth//2 of U-ViT, one level per encoder/decoder block
-  queries_per_level: 4      # 4 tokens per abstraction level
-  bottleneck_queries: 2     # 2 global summary tokens
-  num_temporal_layers: 2    # Self-attention layers for temporal mixing
-  num_qformer_layers: 2     # Cross-attention layers for query extraction
-  nhead: 12                 # 768/12 = 64 per head
+  d_model: 768                        # Match U-ViT embed_dim
+  num_levels: 4                       # Hierarchical abstraction levels
+  queries_per_level: 4                # 4 tokens per level
+  bottleneck_queries: 2               # 2 global summary tokens
+  num_cross_modal_layers: 2           # Cross-modal attention depth
+  num_temporal_layers: 4              # Temporal mixing depth (was 2)
+  num_qformer_layers_per_level: 1     # Per-level decoder depth
+  nhead: 12                           # 768/12 = 64 per head
   dropout: 0.2
+  aux_loss_weight: 0.1                # Weight for auxiliary fMRI reconstruction loss
 
 # ============================================================
 # U-ViT 1D Velocity Network (replaces DiT)
@@ -140,7 +145,7 @@ modalities:
 # Training / Flow Matching configuration
 # ============================================================
 training:
-  batch_size: 256
+  batch_size:  128
   num_workers: 4
   learning_rate: 1.0e-4
   weight_decay: 5.0e-3
