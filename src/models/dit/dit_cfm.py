@@ -212,7 +212,7 @@ class DiTConditional(nn.Module):
         # Patchify and add position embed
         x = self.x_embedder(x) + self.pos_embed  # (B, L, hidden_size)
         
-        # Embed timestep
+        # Embed timestep (raw t in [0,1] from Flow Matching — no scaling, matches torchcfm)
         t_emb = self.t_embedder(t)              # (B, hidden_size)
         
         # Run through blocks

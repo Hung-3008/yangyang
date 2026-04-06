@@ -80,6 +80,7 @@ class SubjectDataModule:
         logger.info(f"  Friends train (seasons {train_seasons}): {len(friends_train)} TRs")
 
         # 2. Movie10 (all)
+        movie10_train = None
         if self.data_cfg.get("train_include_movie10", True):
             movie10_train = FlowMatchingDataset(
                 subject=self.subject,
@@ -91,6 +92,37 @@ class SubjectDataModule:
             )
             train_datasets.append(movie10_train)
             logger.info(f"  Movie10 train: {len(movie10_train)} TRs")
+
+        # --- Unify normalization stats across ALL training data ---
+        # Merge stats from friends + movie10 using combined Welford merge
+        if self.data_cfg.get("normalize_fmri", True) and hasattr(friends_train, "_fmri_mean"):
+            if movie10_train is not None and hasattr(movie10_train, "_fmri_mean"):
+                # Combine two sets of Welford stats
+                import numpy as np
+                n_f = friends_train._fmri_n if hasattr(friends_train, "_fmri_n") else len(friends_train)
+                n_m = movie10_train._fmri_n if hasattr(movie10_train, "_fmri_n") else len(movie10_train)
+                n_total = n_f + n_m
+                mean_f = friends_train._fmri_mean.astype(np.float64)
+                mean_m = movie10_train._fmri_mean.astype(np.float64)
+                std_f = friends_train._fmri_std.astype(np.float64)
+                std_m = movie10_train._fmri_std.astype(np.float64)
+
+                # Combined mean
+                combined_mean = (n_f * mean_f + n_m * mean_m) / n_total
+                # Combined variance (parallel Welford)
+                combined_var = (
+                    (n_f * (std_f**2 + (mean_f - combined_mean)**2) +
+                     n_m * (std_m**2 + (mean_m - combined_mean)**2)) / n_total
+                )
+                combined_std = np.sqrt(combined_var).astype(np.float32)
+                combined_mean = combined_mean.astype(np.float32)
+
+                # Share unified stats to ALL datasets
+                friends_train._fmri_mean = combined_mean
+                friends_train._fmri_std = combined_std
+                movie10_train._fmri_mean = combined_mean
+                movie10_train._fmri_std = combined_std
+                logger.info(f"  Unified fMRI stats across friends+movie10 (n={n_total})")
 
         # Combine
         if len(train_datasets) > 1:

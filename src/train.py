@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import csv
 
 # Integrate original torchcfm library
@@ -102,7 +102,19 @@ class FlowMatchingTrainer:
             lr=float(train_cfg["learning_rate"]), 
             weight_decay=float(train_cfg["weight_decay"])
         )
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=self.epochs)
+        # Warmup for first 5 epochs then cosine decay
+        warmup_epochs = 5
+        self.warmup_scheduler = LinearLR(
+            self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
+        )
+        self.cosine_scheduler = CosineAnnealingLR(
+            self.optimizer, T_max=self.epochs - warmup_epochs
+        )
+        self.scheduler = SequentialLR(
+            self.optimizer,
+            schedulers=[self.warmup_scheduler, self.cosine_scheduler],
+            milestones=[warmup_epochs]
+        )
 
     def train_step(self, batch):
         self.optimizer.zero_grad()
@@ -114,33 +126,37 @@ class FlowMatchingTrainer:
         # 2. Noise Generation
         x0 = torch.randn_like(x1) # (B, 1000)
         
-        # 3. Sample from OT Flow Matching to get t, xt, and target vector field ut
-        t, xt, ut = self.flow_matcher.sample_location_and_conditional_flow(x0, x1)
-        
-        # 4. Predict Flow
+        # 3. Predict Condition
         # Forward condition through Fusion Encoder to get `C` tensor (B, 8, 1024)
         C = self.fusion_encoder(condition)
+
+        # 4. Sample from OT Flow Matching to get t, xt, and target vector field ut
+        # We MUST use guided_sample... and pass C as y1 so that C gets shuffled together with x1!
+        t, xt, ut, _, C_shuffled = self.flow_matcher.guided_sample_location_and_conditional_flow(
+            x0, x1, y1=C
+        )
         
-        # Pass to Velocity network to predict ut (vt_pred)
-        vt_pred = self.dit(xt, t, C)
+        # 5. Predict Flow
+        # Pass to Velocity network to predict ut (vt_pred) using the aligned C_shuffled
+        vt_pred = self.dit(xt, t, C_shuffled)
         
-        # 5. MSE Loss Backpropagation
+        # 6. MSE Loss Backpropagation
         loss = self.criterion(vt_pred, ut)
         loss.backward()
         
         # Gradient Clipping to prevent exploding gradients.
-        torch.nn.utils.clip_grad_norm_(self.fusion_encoder.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(self.dit.parameters(), 1.0)
+        enc_grad_norm = torch.nn.utils.clip_grad_norm_(self.fusion_encoder.parameters(), 1.0)
+        dit_grad_norm = torch.nn.utils.clip_grad_norm_(self.dit.parameters(), 1.0)
         
         self.optimizer.step()
         
-        return loss.item()
+        return loss.item(), enc_grad_norm.item(), dit_grad_norm.item()
 
     def train(self):
         log_freq = self.config["training"].get("log_freq", 50)
         
-        # Init CSV
-        if not self.fast_dev_run and not self.history_file.exists():
+        # Init CSV (always overwrite to ensure correct header)
+        if not self.fast_dev_run:
             with open(self.history_file, mode='w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(["epoch", "train_loss", "val_loss", "val_pcc", "lr"])
@@ -157,12 +173,17 @@ class FlowMatchingTrainer:
             epoch_loss = 0.0
             
             for step, batch in enumerate(pbar):
-                loss = self.train_step(batch)
+                loss, enc_gn, dit_gn = self.train_step(batch)
                 epoch_loss += loss
                 
-                # Log Progress
+                # Log Progress with gradient norms
                 if step % log_freq == 0:
-                    pbar.set_postfix({"Loss": f"{loss:.4f}"})
+                    pbar.set_postfix({
+                        "Loss": f"{loss:.4f}",
+                        "EncGN": f"{enc_gn:.2f}",
+                        "DiTGN": f"{dit_gn:.2f}",
+                        "LR": f"{self.scheduler.get_last_lr()[0]:.2e}"
+                    })
                 
                 if self.fast_dev_run and step >= 5: # Fast run a few steps for debugging
                     break
@@ -193,7 +214,9 @@ class FlowMatchingTrainer:
                     "fusion_encoder": self.fusion_encoder.state_dict(),
                     "dit": self.dit.state_dict(),
                     "optimizer": self.optimizer.state_dict(),
-                    "val_loss": val_loss
+                    "scheduler": self.scheduler.state_dict(),
+                    "val_loss": val_loss,
+                    "val_pcc": val_pcc
                 }, self.save_dir / f"checkpoint_epoch_{epoch}.pt")
                 
             if self.fast_dev_run:
@@ -218,9 +241,12 @@ class FlowMatchingTrainer:
             x0 = torch.randn_like(x1)
             
             # 1. Validation Loss on flow matching
-            t, xt, ut = self.flow_matcher.sample_location_and_conditional_flow(x0, x1)
+            # Evaluate condition C first to shuffle it alongside x1
             C = self.fusion_encoder(condition)
-            vt_pred = self.dit(xt, t, C)
+            t, xt, ut, _, C_shuffled = self.flow_matcher.guided_sample_location_and_conditional_flow(
+                x0, x1, y1=C
+            )
+            vt_pred = self.dit(xt, t, C_shuffled)
             
             loss = self.criterion(vt_pred, ut)
             val_loss += loss.item()

@@ -410,6 +410,7 @@ class FlowMatchingDataset(Dataset):
 
         self._fmri_mean = mean.astype(np.float32)
         self._fmri_std = std.astype(np.float32)
+        self._fmri_n = n  # Store count for potential stat merging
 
         logger.info(
             f"  fMRI stats: mean=[{mean.min():.3f}, {mean.max():.3f}], "
