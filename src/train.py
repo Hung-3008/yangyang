@@ -1,9 +1,9 @@
 """
-Training Loop for Conditional Flow Matching (Variant 1).
-- Extract x1 and Condition from Dataloader
-- Generate x0 (Noise)
-- OT Flow Matcher extracts t, xt, ut
-- DiT model learns MSE Loss between predicted velocity (vt_pred) and target vector field (ut).
+Training Loop for Conditional Flow Matching (v2).
+Changes vs v1:
+  - EMA (Exponential Moving Average) for smoother validation/inference weights
+  - CFG (Classifier-Free Guidance) with random condition dropout during training
+  - Anti-overfitting: increased dropout, weight_decay, longer cosine schedule
 """
 
 import os
@@ -32,6 +32,7 @@ from torchcfm.conditional_flow_matching import ExactOptimalTransportConditionalF
 from src.data.datamodule import SubjectDataModule
 from src.models import MultimodalFusionEncoder
 from src.models.dit import DiTConditional
+from src.utils.ema import EMAModel
 
 
 class FlowMatchingTrainer:
@@ -48,11 +49,22 @@ class FlowMatchingTrainer:
         self._setup_models()
         self._setup_flow_matcher()
         self._setup_optimizer()
+        self._setup_ema()
+        
+        # CFG config
+        cfg_config = self.config.get("cfg", {})
+        self.cfg_enabled = cfg_config.get("enabled", False)
+        self.cond_drop_prob = cfg_config.get("cond_drop_prob", 0.15)
+        self.guidance_scale = cfg_config.get("guidance_scale", 2.0)
+        
+        if self.cfg_enabled:
+            logger.info(f"CFG enabled: drop_prob={self.cond_drop_prob}, guidance_scale={self.guidance_scale}")
         
         # Create save dir in advance
         self.save_dir = Path(self.config["training"]["save_dir"]) / self.subject
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.history_file = self.save_dir / "history.csv"
+
     def _setup_data(self):
         logger.info(f"Setting up dataset for {self.subject}...")
         self.datamodule = SubjectDataModule(
@@ -116,6 +128,44 @@ class FlowMatchingTrainer:
             milestones=[warmup_epochs]
         )
 
+    def _setup_ema(self):
+        """Initialize EMA if enabled in config."""
+        ema_cfg = self.config.get("ema", {})
+        self.ema_enabled = ema_cfg.get("enabled", False)
+        
+        if self.ema_enabled:
+            self.ema = EMAModel(
+                models=[self.fusion_encoder, self.dit],
+                decay=ema_cfg.get("decay", 0.999),
+                warmup_steps=ema_cfg.get("warmup_steps", 1000),
+            )
+            logger.info(f"EMA enabled: decay={ema_cfg.get('decay', 0.999)}, warmup={ema_cfg.get('warmup_steps', 1000)} steps")
+        else:
+            self.ema = None
+
+    def _apply_cfg_dropout(self, C: torch.Tensor) -> torch.Tensor:
+        """Randomly drop condition tokens for CFG training.
+        
+        With probability `cond_drop_prob`, replace the entire condition
+        tensor with zeros for a sample in the batch. This teaches the model
+        to generate unconditionally (null condition = zeros).
+        
+        Args:
+            C: Condition tensor from Fusion Encoder, shape (B, num_latents, d_model)
+            
+        Returns:
+            C with some samples zeroed out
+        """
+        if not self.cfg_enabled or not self.fusion_encoder.training:
+            return C
+        
+        B = C.size(0)
+        # Create mask: 1 = keep condition, 0 = drop condition
+        drop_mask = torch.rand(B, device=C.device) > self.cond_drop_prob  # (B,)
+        drop_mask = drop_mask.float().unsqueeze(1).unsqueeze(2)  # (B, 1, 1) for broadcasting
+        
+        return C * drop_mask
+
     def train_step(self, batch):
         self.optimizer.zero_grad()
         
@@ -129,18 +179,21 @@ class FlowMatchingTrainer:
         # 3. Predict Condition
         # Forward condition through Fusion Encoder to get `C` tensor (B, 8, 1024)
         C = self.fusion_encoder(condition)
+        
+        # 4. CFG: Randomly drop condition for some samples
+        C = self._apply_cfg_dropout(C)
 
-        # 4. Sample from OT Flow Matching to get t, xt, and target vector field ut
+        # 5. Sample from OT Flow Matching to get t, xt, and target vector field ut
         # We MUST use guided_sample... and pass C as y1 so that C gets shuffled together with x1!
         t, xt, ut, _, C_shuffled = self.flow_matcher.guided_sample_location_and_conditional_flow(
             x0, x1, y1=C
         )
         
-        # 5. Predict Flow
+        # 6. Predict Flow
         # Pass to Velocity network to predict ut (vt_pred) using the aligned C_shuffled
         vt_pred = self.dit(xt, t, C_shuffled)
         
-        # 6. MSE Loss Backpropagation
+        # 7. MSE Loss Backpropagation
         loss = self.criterion(vt_pred, ut)
         loss.backward()
         
@@ -149,6 +202,10 @@ class FlowMatchingTrainer:
         dit_grad_norm = torch.nn.utils.clip_grad_norm_(self.dit.parameters(), 1.0)
         
         self.optimizer.step()
+        
+        # 8. EMA update (after optimizer step)
+        if self.ema is not None:
+            self.ema.update()
         
         return loss.item(), enc_grad_norm.item(), dit_grad_norm.item()
 
@@ -161,9 +218,9 @@ class FlowMatchingTrainer:
                 writer = csv.writer(f)
                 writer.writerow(["epoch", "train_loss", "val_loss", "val_pcc", "lr"])
         
-        log_freq = self.config["training"].get("log_freq", 50)
-        
         logger.info(f"Starting training on device: {self.device}")
+        
+        best_pcc = -1.0
         
         for epoch in range(1, self.epochs + 1):
             self.fusion_encoder.train()
@@ -190,7 +247,7 @@ class FlowMatchingTrainer:
                     
             avg_train_loss = epoch_loss / len(self.train_dl)
             
-            # Validation every 5 epochs
+            # Validation every N epochs
             val_every = self.config["training"].get("val_every", 5)
             if epoch % val_every == 0 or epoch == self.epochs:
                 val_loss, val_pcc = self.validate()
@@ -202,33 +259,58 @@ class FlowMatchingTrainer:
                     with open(self.history_file, mode='a', newline='') as f:
                         writer = csv.writer(f)
                         writer.writerow([epoch, avg_train_loss, val_loss, val_pcc, self.scheduler.get_last_lr()[0]])
+                
+                # Save best model (only after validation)
+                if not self.fast_dev_run and val_pcc > best_pcc:
+                    best_pcc = val_pcc
+                    self._save_checkpoint(epoch, val_loss, val_pcc, tag="best")
+                    logger.info(f"  ★ New best PCC: {val_pcc:.4f}")
             else:
                 logger.info(f"[Epoch {epoch}] Train Loss: {avg_train_loss:.4f} | Val (Skipped)")
             
             self.scheduler.step()
             
-            # Checkpointing
-            if not self.fast_dev_run and epoch % 10 == 0:
-                torch.save({
-                    "epoch": epoch,
-                    "fusion_encoder": self.fusion_encoder.state_dict(),
-                    "dit": self.dit.state_dict(),
-                    "optimizer": self.optimizer.state_dict(),
-                    "scheduler": self.scheduler.state_dict(),
-                    "val_loss": val_loss,
-                    "val_pcc": val_pcc
-                }, self.save_dir / f"checkpoint_epoch_{epoch}.pt")
+            # Save latest checkpoint every epoch (for resume capability)
+            if not self.fast_dev_run:
+                self._save_checkpoint(epoch, avg_train_loss, best_pcc, tag="latest")
                 
             if self.fast_dev_run:
                 break
                 
         logger.info("Training Complete!")
 
+    def _save_checkpoint(self, epoch, val_loss, val_pcc, tag="latest"):
+        """Save checkpoint including EMA state."""
+        ckpt = {
+            "epoch": epoch,
+            "fusion_encoder": self.fusion_encoder.state_dict(),
+            "dit": self.dit.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+            "val_loss": val_loss,
+            "val_pcc": val_pcc,
+        }
+        if self.ema is not None:
+            ckpt["ema"] = self.ema.state_dict()
+        
+        torch.save(ckpt, self.save_dir / f"checkpoint_{tag}.pt")
+
     @torch.no_grad()
     def validate(self):
+        """Validate using EMA weights (if enabled) and CFG inference."""
         self.fusion_encoder.eval()
         self.dit.eval()
         
+        # Use EMA weights for validation if available
+        ema_ctx = self.ema.apply() if self.ema is not None else _nullcontext()
+        
+        with ema_ctx:
+            val_loss, val_pcc = self._run_validation()
+        
+        return val_loss, val_pcc
+    
+    def _run_validation(self):
+        """Core validation logic, separated for EMA context usage."""
         val_loss = 0.0
         num_batches = 0
         
@@ -240,8 +322,7 @@ class FlowMatchingTrainer:
             condition = batch["condition"].to(self.device)
             x0 = torch.randn_like(x1)
             
-            # 1. Validation Loss on flow matching
-            # Evaluate condition C first to shuffle it alongside x1
+            # 1. Validation Loss on flow matching (no CFG dropout)
             C = self.fusion_encoder(condition)
             t, xt, ut, _, C_shuffled = self.flow_matcher.guided_sample_location_and_conditional_flow(
                 x0, x1, y1=C
@@ -251,15 +332,32 @@ class FlowMatchingTrainer:
             loss = self.criterion(vt_pred, ut)
             val_loss += loss.item()
             
-            # 2. ODE Solver (Euler method) for Generation & PCC computation
-            # We predict x1_pred from x0 noise by integrating vt_pred
+            # 2. ODE Solver with CFG for Generation & PCC computation
             x_pred = x0.clone()
-            steps = 10  # 10 steps is usually enough for CFM validation
+            steps = 10
             dt = 1.0 / steps
+            
             for st in range(steps):
                 t_val = torch.full((x0.size(0),), st * dt, device=self.device)
-                v_pred = self.dit(x_pred, t_val, C)
-                x_pred = x_pred + v_pred * dt
+                
+                if self.cfg_enabled:
+                    # CFG inference: v_guided = v_uncond + w * (v_cond - v_uncond)
+                    B = x_pred.size(0)
+                    null_C = torch.zeros_like(C)
+                    
+                    # Batch both forward passes for efficiency
+                    x_double = torch.cat([x_pred, x_pred], dim=0)
+                    t_double = torch.cat([t_val, t_val], dim=0)
+                    C_double = torch.cat([null_C, C], dim=0)
+                    
+                    v_double = self.dit(x_double, t_double, C_double)
+                    v_uncond, v_cond = v_double.chunk(2, dim=0)
+                    
+                    v_guided = v_uncond + self.guidance_scale * (v_cond - v_uncond)
+                    x_pred = x_pred + v_guided * dt
+                else:
+                    v_pred = self.dit(x_pred, t_val, C)
+                    x_pred = x_pred + v_pred * dt
                 
             all_x1.append(x1.cpu())
             all_pred.append(x_pred.cpu())
@@ -284,6 +382,14 @@ class FlowMatchingTrainer:
         val_pcc = pcc.mean().item()
         
         return val_loss / num_batches, val_pcc
+
+
+class _nullcontext:
+    """Minimal null context manager for Python < 3.10 compatibility."""
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        pass
 
 
 if __name__ == "__main__":

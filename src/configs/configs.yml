@@ -45,14 +45,14 @@ fusion_encoder:
   num_latents: 8
   num_layers: 4
   nhead: 8
-  dropout: 0.1
+  dropout: 0.2       # Tăng từ 0.1 → 0.2 chống overfitting
 
 velocity_net:
   patch_size: 20       # 1000 vùng não chunk thành 50 sequence tokens.
   d_model: 768
   nhead: 12
   depth: 8
-  dropout: 0.1
+  dropout: 0.2         # Tăng từ 0.1 → 0.2 chống overfitting
   context_dim: 1024    # Nhận context từ fusion_encoder
 
 # ============================================================
@@ -126,12 +126,28 @@ training:
   batch_size: 256
   num_workers: 4
   learning_rate: 1.0e-4
-  weight_decay: 1.0e-4
-  epochs: 100
+  weight_decay: 5.0e-3   # Tăng từ 1e-4 → 5e-3 chống overfitting
+  epochs: 300             # Tăng từ 100 → 300 cho cosine decay chậm hơn
   seed: 42
   save_dir: "checkpoints"
   log_freq: 50
-  val_every: 5        # Run validation every N epochs
+  val_every: 5            # Run validation every N epochs
 
 flow_matching:
-  sigma: 0.0          # Xác suất nhiễu cho OT Flow Matching
+  sigma: 0.0              # Xác suất nhiễu cho OT Flow Matching
+
+# ============================================================
+# EMA (Exponential Moving Average)
+# ============================================================
+ema:
+  enabled: true
+  decay: 0.999            # Shadow weight update rate
+  warmup_steps: 1000      # Linearly ramp decay during warmup
+
+# ============================================================
+# Classifier-Free Guidance (CFG)
+# ============================================================
+cfg:
+  enabled: true
+  cond_drop_prob: 0.15    # 15% chance to drop condition during training
+  guidance_scale: 2.0     # w for inference: v = v_uncond + w*(v_cond - v_uncond)
