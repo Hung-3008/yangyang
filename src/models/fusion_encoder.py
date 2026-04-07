@@ -1,105 +1,126 @@
 """
-Multimodal Fusion Encoder
--------------------------
-Nén 31 frames dữ liệu thời gian của 8 modalities (22,144 dims) thành một tập
-hợp các latent tokens nhỏ gọn (ví dụ: 8 tokens x 1024 dims) bằng kiến trúc
-giống Q-Former / Perceiver Resampler.
+Fusion Encoder — Per-Modality Bidirectional GRU
+=================================================
+Each modality gets its own temporal projection:
+  1. Linear(dim_i → d_proj)  — project to common lower dimension
+  2. Bidirectional GRU       — compress 31 frames into 1 summary vector
+  3. Linear(2×d_hidden → d_model) — project to U-ViT dimension
+
+All modalities produce one vector each → stacked as condition tokens.
+
+Output: (B, num_modalities, d_model)  e.g. (B, 11, 768)
+        11 condition tokens for U-ViT, one per modality.
 """
 
-import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=500):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # Shape: (1, max_len, d_model)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        """
-        x: Tensor, shape [B, T, D]
-        """
-        return x + self.pe[:, :x.size(1), :]
-
-
-class MultimodalFusionEncoder(nn.Module):
+class PerModalityGRU(nn.Module):
+    """Temporal projection for a single modality using Bidirectional GRU.
+    
+    (B, T, dim_i)  →  (B, d_model)
+    
+    The BiGRU reads the 31-frame sequence in both directions.
+    The final hidden states (forward + backward) are concatenated
+    and projected to d_model.
     """
-    1. Linear Projection (22144 -> 1024)
-    2. Temporal Transformer Encoder (Mix context across 31 frames)
-    3. Q-Former / Transformer Decoder (Compress to `num_latents` tokens)
-    """
-    def __init__(
-        self,
-        input_dim: int = 22144,
-        d_model: int = 1024,
-        num_latents: int = 8,
-        num_layers: int = 4,
-        nhead: int = 8,
-        dropout: float = 0.1
-    ):
+
+    def __init__(self, in_dim: int, d_proj: int, d_hidden: int,
+                 d_model: int, dropout: float = 0.2):
         super().__init__()
-        self.d_model = d_model
-        self.num_latents = num_latents
-        
-        # 1. Modality Projection
-        self.proj = nn.Linear(input_dim, d_model)
-        self.pos_embed = PositionalEncoding(d_model, max_len=500)
-        
-        # 2. Temporal Context Mixing (Self-Attention over time)
-        # Using 2 layers for local temporal mixing before cross-attention.
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=d_model * 4, 
-            dropout=dropout, 
-            batch_first=True
+        self.proj = nn.Linear(in_dim, d_proj)
+        self.gru = nn.GRU(
+            input_size=d_proj,
+            hidden_size=d_hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.0,  # no dropout for single-layer GRU
         )
-        self.temporal_transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        
-        # 3. Querying / Latent Resampling (Cross-Attention for compression)
-        self.latent_queries = nn.Parameter(torch.randn(1, num_latents, d_model))
-        
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            batch_first=True
+        self.out_proj = nn.Sequential(
+            nn.LayerNorm(2 * d_hidden),
+            nn.Linear(2 * d_hidden, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
-        # The decoder acts as the Q-Former: 
-        # Target (tgt) = latent_queries
-        # Memory = temporal context
-        self.q_former = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
-        
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Tensor shape (B, T, input_dim)
-               e.g. B = batch_size, T = 31 (window_size), input_dim = 22144
-               
+            x: (B, T, in_dim)
         Returns:
-            out: Tensor shape (B, num_latents, d_model)
-                 e.g. B = batch_size, num_latents = 8, d_model = 1024
+            (B, d_model)
         """
-        B, T, _ = x.shape
+        x = self.proj(x)                    # (B, T, d_proj)
+
+        # GRU forward: h_n shape = (2, B, d_hidden) for bidirectional
+        _, h_n = self.gru(x)                
         
-        # 1. Project into d_model space & add temporal positioning
-        x = self.proj(x)                  # (B, T, d_model)
-        x = self.pos_embed(x)             # (B, T, d_model)
-        
-        # 2. Mix temporal information (let frames talk to each other)
-        memory = self.temporal_transformer(x)    # (B, T, d_model)
-        
-        # 3. Extract latents using Cross-Attention (Q-Former logic)
-        queries = self.latent_queries.expand(B, -1, -1)  # (B, num_latents, d_model)
-        
-        out = self.q_former(tgt=queries, memory=memory)  # (B, num_latents, d_model)
-        
-        return out
+        # Concatenate forward and backward final hidden states
+        h_fwd = h_n[0]                      # (B, d_hidden)
+        h_bwd = h_n[1]                      # (B, d_hidden)
+        h_cat = torch.cat([h_fwd, h_bwd], dim=-1)  # (B, 2*d_hidden)
+
+        return self.out_proj(h_cat)          # (B, d_model)
+
+
+class FusionEncoder(nn.Module):
+    """
+    Per-modality BiGRU fusion encoder.
+
+    Input:  (B, T, total_dim)  — concatenated multimodal features
+    Output: (B, num_modalities, d_model)  — one condition token per modality
+
+    Parameters
+    ----------
+    modality_dims : list[int]
+        Dimension of each modality in concatenation order.
+    d_model : int
+        Output embedding dimension (should match U-ViT embed_dim).
+    d_proj : int
+        Intermediate projection dim before GRU (controls GRU param count).
+    d_hidden : int
+        GRU hidden size per direction.
+    dropout : float
+        Dropout probability.
+    """
+
+    def __init__(
+        self,
+        modality_dims: list[int],
+        d_model: int = 768,
+        d_proj: int = 256,
+        d_hidden: int = 256,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.modality_dims = modality_dims
+        self.num_modalities = len(modality_dims)
+        self.d_model = d_model
+
+        # Per-modality BiGRU blocks
+        self.blocks = nn.ModuleList([
+            PerModalityGRU(dim, d_proj, d_hidden, d_model, dropout)
+            for dim in modality_dims
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, total_dim)  e.g. (B, 31, sum(modality_dims))
+
+        Returns:
+            (B, num_modalities, d_model)  e.g. (B, 11, 768)
+        """
+        # 1. Split concatenated features by modality
+        splits = torch.split(x, self.modality_dims, dim=-1)
+
+        # 2. Per-modality BiGRU → each outputs (B, d_model)
+        modality_vectors = [block(s) for block, s in zip(self.blocks, splits)]
+
+        # 3. Stack into condition tokens
+        tokens = torch.stack(modality_vectors, dim=1)  # (B, M, d_model)
+
+        return tokens

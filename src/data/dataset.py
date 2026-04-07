@@ -364,6 +364,10 @@ class FlowMatchingDataset(Dataset):
             if mod_cfg.get("needs_squeeze", False) and feat_slice.ndim > 2:
                 # Nếu pooling script chưa squeeze được hoàn toàn thì squeeze
                 feat_slice = feat_slice.reshape(-1, dim)
+            
+            # Xử lý avg pool cho modality có spatial tokens (e.g. dinov2_giant: T, 4, 1536)
+            if mod_cfg.get("needs_avg_pool", False) and feat_slice.ndim > 2:
+                feat_slice = feat_slice.mean(axis=1)  # (T, S, D) → (T, D)
                 
             valid_L = valid_end - actual_valid_start
             feat = feat_slice.reshape(valid_L, dim)

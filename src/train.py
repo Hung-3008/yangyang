@@ -32,7 +32,7 @@ from torchcfm.conditional_flow_matching import ExactOptimalTransportConditionalF
 
 # Custom imports
 from src.data.datamodule import SubjectDataModule
-from src.models import FusionEncoderV2
+from src.models import FusionEncoder
 from src.models.uvit1d import UViT1D
 from src.utils.ema import EMAModel
 
@@ -55,7 +55,7 @@ class FlowMatchingTrainer:
         self.guidance_scale = cfg_config.get("guidance_scale", 2.0)
         
         # Auxiliary loss weight
-        self.aux_loss_weight = self.config["fusion_encoder"].get("aux_loss_weight", 0.1)
+        self.aux_loss_weight = self.config["fusion_encoder"].get("aux_loss_weight", 0.0)
         
         if self.cfg_enabled:
             logger.info(f"CFG enabled: drop_prob={self.cond_drop_prob}, guidance_scale={self.guidance_scale}")
@@ -80,34 +80,27 @@ class FlowMatchingTrainer:
         self.datamodule.setup()
         self.train_dl = self.datamodule.train_dataloader()
         self.val_dl = self.datamodule.val_dataloader()
-        
+
     def _setup_models(self):
-        logger.info("Initializing Fusion Encoder V2 and U-ViT 1D...")
+        logger.info("Initializing Fusion Encoder (BiGRU) and U-ViT 1D...")
         enc_cfg = self.config["fusion_encoder"]
         
         # Extract per-modality dimensions from config (order matters!)
+        modality_names = list(self.config["modalities"].keys())
         modality_dims = [cfg["dim"] for cfg in self.config["modalities"].values()]
-        logger.info(f"  Modality dims: {modality_dims} (total={sum(modality_dims)})")
+        logger.info(f"  {len(modality_dims)} modalities: {modality_names}")
+        logger.info(f"  Dims: {modality_dims} (total={sum(modality_dims)})")
         
-        self.fusion_encoder = FusionEncoderV2(
+        self.fusion_encoder = FusionEncoder(
             modality_dims=modality_dims,
             d_model=enc_cfg["d_model"],
-            num_levels=enc_cfg["num_levels"],
-            queries_per_level=enc_cfg["queries_per_level"],
-            bottleneck_queries=enc_cfg["bottleneck_queries"],
-            num_cross_modal_layers=enc_cfg.get("num_cross_modal_layers", 2),
-            num_temporal_layers=enc_cfg["num_temporal_layers"],
-            num_qformer_layers_per_level=enc_cfg.get("num_qformer_layers_per_level", 1),
-            nhead=enc_cfg["nhead"],
+            d_proj=enc_cfg.get("d_proj", 256),
+            d_hidden=enc_cfg.get("d_hidden", 256),
             dropout=enc_cfg["dropout"],
-            fmri_dim=self.config["data"]["fmri_dim"],
         ).to(self.device)
         
-        # Compute total condition tokens for U-ViT
-        num_cond_tokens = (
-            enc_cfg["num_levels"] * enc_cfg["queries_per_level"]
-            + enc_cfg["bottleneck_queries"]
-        )
+        # Condition tokens = one per modality
+        num_cond_tokens = len(modality_dims)
         
         uvit_cfg = self.config["uvit"]
         self.uvit = UViT1D(
@@ -127,11 +120,10 @@ class FlowMatchingTrainer:
         # Log parameter counts
         enc_params = sum(p.numel() for p in self.fusion_encoder.parameters())
         uvit_params = sum(p.numel() for p in self.uvit.parameters())
-        logger.info(f"  Fusion Encoder V2: {enc_params/1e6:.1f}M params")
-        logger.info(f"  U-ViT 1D:         {uvit_params/1e6:.1f}M params")
-        logger.info(f"  Total:             {(enc_params + uvit_params)/1e6:.1f}M params")
-        logger.info(f"  Condition tokens:  {num_cond_tokens}")
-        logger.info(f"  Aux loss weight:   {self.aux_loss_weight}")
+        logger.info(f"  Fusion Encoder:  {enc_params/1e6:.1f}M params")
+        logger.info(f"  U-ViT 1D:       {uvit_params/1e6:.1f}M params")
+        logger.info(f"  Total:           {(enc_params + uvit_params)/1e6:.1f}M params")
+        logger.info(f"  Condition tokens: {num_cond_tokens} (= num_modalities)")
         
     def _setup_flow_matcher(self):
         sigma = self.config["flow_matching"].get("sigma", 0.0)
@@ -211,14 +203,13 @@ class FlowMatchingTrainer:
         # 2. Noise Generation
         x0 = torch.randn_like(x1) # (B, 1000)
         
-        # 3. Encode condition (with auxiliary fMRI prediction)
-        C, aux_pred = self.fusion_encoder(condition, return_aux=True)  # (B, 18, 768), (B, 1000)
+        # 3. Encode condition → (B, 31, 768) one token per frame
+        C = self.fusion_encoder(condition)
         
         # 4. CFG: Randomly drop condition for some samples
         C = self._apply_cfg_dropout(C)
 
         # 5. Sample from OT Flow Matching to get t, xt, and target vector field ut
-        # C gets shuffled together with x1 according to OT plan
         t, xt, ut, _, C_shuffled = self.flow_matcher.guided_sample_location_and_conditional_flow(
             x0, x1, y1=C
         )
@@ -226,10 +217,8 @@ class FlowMatchingTrainer:
         # 6. Predict velocity using U-ViT
         vt_pred = self.uvit(xt, t, C_shuffled)
         
-        # 7. Loss = Flow Matching MSE + Auxiliary Reconstruction MSE
-        loss_flow = self.criterion(vt_pred, ut)
-        loss_aux = self.criterion(aux_pred, x1)
-        loss = loss_flow + self.aux_loss_weight * loss_aux
+        # 7. Loss
+        loss = self.criterion(vt_pred, ut)
         
         loss.backward()
         
@@ -243,7 +232,7 @@ class FlowMatchingTrainer:
         if self.ema is not None:
             self.ema.update()
         
-        return loss.item(), loss_flow.item(), loss_aux.item(), enc_grad_norm.item(), uvit_grad_norm.item()
+        return loss.item(), enc_grad_norm.item(), uvit_grad_norm.item()
 
     def train(self):
         log_freq = self.config["training"].get("log_freq", 50)
@@ -252,7 +241,7 @@ class FlowMatchingTrainer:
         if not self.fast_dev_run:
             with open(self.history_file, mode='w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(["epoch", "train_loss", "loss_flow", "loss_aux", "val_loss", "val_pcc", "lr"])
+                writer.writerow(["epoch", "train_loss", "val_loss", "val_pcc", "lr"])
         
         logger.info(f"Starting training on device: {self.device}")
         
@@ -264,21 +253,15 @@ class FlowMatchingTrainer:
             
             pbar = tqdm(self.train_dl, desc=f"Epoch {epoch}/{self.epochs}")
             epoch_loss = 0.0
-            epoch_loss_flow = 0.0
-            epoch_loss_aux = 0.0
             
             for step, batch in enumerate(pbar):
-                loss, loss_flow, loss_aux, enc_gn, uvit_gn = self.train_step(batch)
+                loss, enc_gn, uvit_gn = self.train_step(batch)
                 epoch_loss += loss
-                epoch_loss_flow += loss_flow
-                epoch_loss_aux += loss_aux
                 
                 # Log Progress with gradient norms
                 if step % log_freq == 0:
                     pbar.set_postfix({
                         "Loss": f"{loss:.4f}",
-                        "Flow": f"{loss_flow:.4f}",
-                        "Aux": f"{loss_aux:.4f}",
                         "EncGN": f"{enc_gn:.2f}",
                         "UViTGN": f"{uvit_gn:.2f}",
                         "LR": f"{self.scheduler.get_last_lr()[0]:.2e}"
@@ -288,8 +271,6 @@ class FlowMatchingTrainer:
                     break
                     
             avg_train_loss = epoch_loss / len(self.train_dl)
-            avg_loss_flow = epoch_loss_flow / len(self.train_dl)
-            avg_loss_aux = epoch_loss_aux / len(self.train_dl)
             
             # Validation every N epochs
             val_every = self.config["training"].get("val_every", 5)
@@ -301,8 +282,7 @@ class FlowMatchingTrainer:
                 torch.cuda.empty_cache()
                 
                 logger.info(
-                    f"[Epoch {epoch}] Loss: {avg_train_loss:.4f} "
-                    f"(flow={avg_loss_flow:.4f}, aux={avg_loss_aux:.4f}) | "
+                    f"[Epoch {epoch}] Loss: {avg_train_loss:.4f} | "
                     f"Val Loss: {val_loss:.4f} | Val PCC: {val_pcc:.4f}"
                 )
                 
@@ -310,7 +290,7 @@ class FlowMatchingTrainer:
                 if not self.fast_dev_run:
                     with open(self.history_file, mode='a', newline='') as f:
                         writer = csv.writer(f)
-                        writer.writerow([epoch, avg_train_loss, avg_loss_flow, avg_loss_aux, val_loss, val_pcc, self.scheduler.get_last_lr()[0]])
+                        writer.writerow([epoch, avg_train_loss, val_loss, val_pcc, self.scheduler.get_last_lr()[0]])
                 
                 # Save best model (only after validation)
                 if not self.fast_dev_run and val_pcc > best_pcc:
@@ -318,10 +298,7 @@ class FlowMatchingTrainer:
                     self._save_checkpoint(epoch, val_loss, val_pcc, tag="best")
                     logger.info(f"  ★ New best PCC: {val_pcc:.4f}")
             else:
-                logger.info(
-                    f"[Epoch {epoch}] Loss: {avg_train_loss:.4f} "
-                    f"(flow={avg_loss_flow:.4f}, aux={avg_loss_aux:.4f}) | Val (Skipped)"
-                )
+                logger.info(f"[Epoch {epoch}] Loss: {avg_train_loss:.4f} | Val (Skipped)")
             
             self.scheduler.step()
             
@@ -377,8 +354,8 @@ class FlowMatchingTrainer:
             condition = batch["condition"].to(self.device)
             x0 = torch.randn_like(x1)
             
-            # 1. Validation Loss on flow matching (no CFG dropout, no aux)
-            C = self.fusion_encoder(condition)  # return_aux=False by default
+            # 1. Validation Loss on flow matching
+            C = self.fusion_encoder(condition)
             t, xt, ut, _, C_shuffled = self.flow_matcher.guided_sample_location_and_conditional_flow(
                 x0, x1, y1=C
             )

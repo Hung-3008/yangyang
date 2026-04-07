@@ -41,25 +41,18 @@ data:
   normalize_fmri: true
 
 # ============================================================
-# Fusion Encoder V2 (Modality-Aware Hierarchical Conditioning)
+# Fusion Encoder (Per-Modality BiGRU Temporal Projection)
 # ============================================================
-# Key improvements over V1:
-#   A) Per-modality projections (each dim_i → d_model independently)
-#   B) Cross-modal attention (modalities interact at each timestep)
-#   C) Per-level Q-Former decoders (each level has own weights)
-#   D) Auxiliary reconstruction loss (encoder must predict fMRI)
-# Total output tokens = num_levels × queries_per_level + bottleneck_queries
+# Each modality gets:
+#   1. Linear(dim_i → d_proj)
+#   2. Bidirectional GRU (d_proj → 2×d_hidden)
+#   3. Linear(2×d_hidden → d_model) + LayerNorm + GELU
+# Output: (B, num_modalities, d_model) — one token per modality
 fusion_encoder:
-  d_model: 768                        # Match U-ViT embed_dim
-  num_levels: 4                       # Hierarchical abstraction levels
-  queries_per_level: 4                # 4 tokens per level
-  bottleneck_queries: 2               # 2 global summary tokens
-  num_cross_modal_layers: 2           # Cross-modal attention depth
-  num_temporal_layers: 4              # Temporal mixing depth (was 2)
-  num_qformer_layers_per_level: 1     # Per-level decoder depth
-  nhead: 12                           # 768/12 = 64 per head
+  d_model: 768              # Must match U-ViT embed_dim
+  d_proj: 256               # Projection dim before GRU
+  d_hidden: 256             # GRU hidden size per direction
   dropout: 0.2
-  aux_loss_weight: 0.1                # Weight for auxiliary fMRI reconstruction loss
 
 # ============================================================
 # U-ViT 1D Velocity Network (replaces DiT)
@@ -138,14 +131,30 @@ modalities:
     dim: 2048
     needs_squeeze: false
 
-# Total feature dim when concatenating all modalities:
-# 1408 + 1280 + 5120 + 3584 + 2048 + 3072 + 3584 + 2048 = 22144
+  ast:
+    layer_key: "layernorm"
+    dim: 768
+    needs_squeeze: false
+
+  dinov2_giant:
+    layer_key: "norm"
+    dim: 1536
+    needs_squeeze: false
+    needs_avg_pool: true    # shape (T, 4, 1536) → avg over spatial → (T, 1536)
+
+  vlm2vec_7b:
+    layer_key: "model.norm"
+    dim: 3584
+    needs_squeeze: false
+
+# Total feature dim when concatenating all 11 modalities:
+# 1408 + 1280 + 5120 + 3584 + 2048 + 3072 + 3584 + 2048 + 768 + 1536 + 3584 = 28032
 
 # ============================================================
 # Training / Flow Matching configuration
 # ============================================================
 training:
-  batch_size:  128
+  batch_size:  256
   num_workers: 4
   learning_rate: 1.0e-4
   weight_decay: 5.0e-3
