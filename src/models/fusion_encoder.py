@@ -55,6 +55,9 @@ class PerModalityGRU(nn.Module):
         """
         x = self.proj(x)                    # (B, T, d_proj)
 
+        # Ensure GRU memory is contiguous (prevents warning and improves speed)
+        self.gru.flatten_parameters()
+
         # GRU forward: h_n shape = (2, B, d_hidden) for bidirectional
         _, h_n = self.gru(x)                
         
