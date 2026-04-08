@@ -41,32 +41,30 @@ data:
   normalize_fmri: true
 
 # ============================================================
-# Fusion Encoder (Per-Modality BiGRU Temporal Projection)
+# Simple Fusion Encoder (replaces Q-Former)
 # ============================================================
-# Each modality gets:
-#   1. Linear(dim_i → d_proj)
-#   2. Bidirectional GRU (d_proj → 2×d_hidden)
-#   3. Linear(2×d_hidden → d_model) + LayerNorm + GELU
-# Output: (B, num_modalities, d_model) — one token per modality
+# Lightweight transformer encoder to fuse modalities across time.
+# Outputs: conditional tokens (B, T, D) and global cond (B, D)
 fusion_encoder:
   d_model: 768              # Must match U-ViT embed_dim
-  d_proj: 256               # Projection dim before GRU
-  d_hidden: 256             # GRU hidden size per direction
-  dropout: 0.2
+  num_layers: 3             # Lightweight (was 4 in Q-Former)
+  num_heads: 8              # Attention heads
+  dropout: 0.1
+  modality_drop_prob: 0.1   # Randomly drop entire modalities during training
 
 # ============================================================
-# U-ViT 1D Velocity Network (replaces DiT)
+# U-ViT 1D v2 Velocity Network (DiT-style)
 # ============================================================
-# Token-concat conditioning + long skip connections.
-# Architecture: 4 in_blocks → 1 mid_block → 4 out_blocks (with skip)
+# AdaLN-Zero + Cross-Attention + Long skip connections.
 uvit:
   patch_size: 20            # 1000 parcels → 50 patches
   embed_dim: 768
   depth: 8                  # 4 encoder + 1 bottleneck + 4 decoder
   num_heads: 12
+  cross_attn_heads: 8       # Heads for cross-attention
   mlp_ratio: 4.0
   qkv_bias: true
-  drop_rate: 0.2
+  drop_rate: 0.1
   skip: true                # Long skip connections (core U-ViT feature)
   use_checkpoint: false     # Gradient checkpointing (saves ~65% memory)
 
@@ -166,6 +164,15 @@ training:
 
 flow_matching:
   sigma: 0.0              # Deterministic OT path (no noise)
+
+# ============================================================
+# Dynamic Interpolant Scheduler (Method 2)
+# ============================================================
+# Condition-dependent interpolation: X_t = α_t(C)·X₁ + σ_t(C)·X₀
+# instead of linear X_t = t·X₁ + (1-t)·X₀
+scheduler:
+  enabled: true
+  d_hidden: 256             # Hidden dim of scheduler MLP
 
 # ============================================================
 # EMA (Exponential Moving Average)
