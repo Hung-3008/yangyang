@@ -389,7 +389,7 @@ class UViT1D(nn.Module):
         x = x + self.pos_embed
 
         # 2. Timestep + pooled condition → combined AdaLN vector
-        t_emb = self.time_embed(timestep_embedding(t, self.embed_dim))  # (B, D)
+        t_emb = self.time_embed(timestep_embedding(t * 1000.0, self.embed_dim))  # (B, D)
         c_emb = self.cond_embed(context.mean(dim=1))                    # (B, D)
         adaln_emb = t_emb + c_emb                                      # (B, D)
 

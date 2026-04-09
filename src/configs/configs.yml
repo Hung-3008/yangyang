@@ -29,6 +29,11 @@ data:
   fmri_run_strategy: "average"
   normalize_fmri: true
 
+  # HRF alignment (matching challenge baseline)
+  excluded_samples_start: 5   # skip first 5 TRs per run (no stimulus info yet)
+  excluded_samples_end: 5     # skip last 5 TRs per run (fMRI may outlast stimulus)
+  hrf_delay: 3                # ~4.5s hemodynamic delay (3 TRs × 1.49s)
+
 # ============================================================
 # Fusion Encoder (Per-Modality Q-Former)
 # ============================================================

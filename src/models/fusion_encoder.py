@@ -15,10 +15,12 @@ class ModalityQFormer(nn.Module):
     """
 
     def __init__(self, in_dim: int, d_model: int, num_queries: int = 1,
-                 num_heads: int = 4, dropout: float = 0.1):
+                 num_heads: int = 4, dropout: float = 0.1, max_len: int = 512):
         super().__init__()
         self.proj = nn.Linear(in_dim, d_model)
         self.queries = nn.Parameter(torch.randn(1, num_queries, d_model) * 0.02)
+        # Learnable positional embedding for temporal KV tokens
+        self.context_pos_emb = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=d_model, num_heads=num_heads,
             dropout=dropout, batch_first=True,
@@ -35,6 +37,9 @@ class ModalityQFormer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
+        # Add positional embedding so attention knows temporal order
+        T = x.size(1)
+        x = x + self.context_pos_emb[:, :T, :]
         q = self.queries.expand(x.size(0), -1, -1)
         out, _ = self.cross_attn(query=q, key=x, value=x)
         out = self.norm1(q + out)

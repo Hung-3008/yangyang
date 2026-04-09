@@ -73,6 +73,11 @@ class FlowMatchingDataset(Dataset):
         self.run_strategy = data_cfg.get("fmri_run_strategy", "average")
         self.normalize_fmri = data_cfg.get("normalize_fmri", True)
 
+        # HRF alignment parameters (matching challenge baseline)
+        self.excl_start = data_cfg.get("excluded_samples_start", 5)
+        self.excl_end = data_cfg.get("excluded_samples_end", 5)
+        self.hrf_delay = data_cfg.get("hrf_delay", 3)
+
         # Compute total feature dimension
         self.total_feat_dim = sum(cfg["dim"] for cfg in modality_configs.values())
 
@@ -238,32 +243,40 @@ class FlowMatchingDataset(Dataset):
         fmri_keys: list[str],
         feat_paths: dict,
     ) -> int:
-        """Determine number of valid TRs.
+        """Determine number of valid TRs after excluding boundary samples.
 
-        Uses fMRI T as base, verified against ONE feature file to catch
-        large mismatches. This avoids opening all 8 modality files per clip
-        during index building (which is very slow on HDD).
+        Follows the challenge baseline convention:
+        - fMRI: exclude first `excl_start` and last `excl_end` TRs per run
+        - Features: checked against ONE file to catch large mismatches
+
+        The returned count is the number of *usable* TRs (after exclusion).
         """
         # Get fMRI time dimension (fMRI file is shared, fast to read shape)
         with h5py.File(fmri_path, "r") as fh:
             fmri_trs = [fh[key].shape[0] for key in fmri_keys]
-            fmri_T = min(fmri_trs)
+            raw_fmri_T = min(fmri_trs)
+
+        # Exclude boundary TRs from fMRI
+        usable_fmri_T = raw_fmri_T - self.excl_start - self.excl_end
+        if usable_fmri_T <= 0:
+            return 0
 
         # Check ONE feature file to verify alignment
         for mod_name, path in feat_paths.items():
             if path is None:
                 continue
             try:
-                # Pooled numpy files are directly accessible
                 feat_T = np.load(path, mmap_mode='r').shape[0]
-                # Use min to handle ±2 TR mismatches
-                return min(fmri_T, feat_T)
+                # Feature file should cover raw_fmri_T; usable count is
+                # limited by the smaller of usable fMRI and available features
+                # (features are indexed starting at excl_start - hrf_delay)
+                return min(usable_fmri_T, feat_T)
             except Exception as e:
                 logger.warning(f"Error reading {path}: {e}")
                 continue
 
-        # No features readable — use fMRI T
-        return fmri_T
+        # No features readable — use usable fMRI T
+        return usable_fmri_T
 
     # ------------------------------------------------------------------
     # Data loading
@@ -305,9 +318,17 @@ class FlowMatchingDataset(Dataset):
                     pass
 
     def _load_fmri(self, clip: dict, tr_idx: int) -> np.ndarray:
-        """Load fMRI for a specific TR, handling run averaging."""
+        """Load fMRI for a specific TR, handling run averaging.
+
+        The raw fMRI index is offset by excl_start to skip the initial
+        non-stimulus TRs, matching the challenge baseline convention.
+        """
         fmri_path = clip["fmri_path"]
         fmri_keys = clip["fmri_keys"]
+
+        # Offset: tr_idx is already in the *usable* space;
+        # raw index = tr_idx + excl_start
+        raw_idx = tr_idx + self.excl_start
 
         def get_arr(key):
             if self.cache_in_memory and fmri_path in self._fmri_cache:
@@ -316,13 +337,13 @@ class FlowMatchingDataset(Dataset):
 
         if self.run_strategy == "average" and len(fmri_keys) > 1:
             # Average across runs
-            runs = [get_arr(k)[tr_idx].astype(np.float32) for k in fmri_keys]
+            runs = [get_arr(k)[raw_idx].astype(np.float32) for k in fmri_keys]
             fmri = np.mean(runs, axis=0)
         elif self.run_strategy == "first":
-            fmri = get_arr(fmri_keys[0])[tr_idx].astype(np.float32)
+            fmri = get_arr(fmri_keys[0])[raw_idx].astype(np.float32)
         else:
             # "all" or single run
-            fmri = get_arr(fmri_keys[0])[tr_idx].astype(np.float32)
+            fmri = get_arr(fmri_keys[0])[raw_idx].astype(np.float32)
 
         # Normalize
         if self.normalize_fmri and hasattr(self, "_fmri_mean"):
@@ -331,55 +352,68 @@ class FlowMatchingDataset(Dataset):
         return fmri
 
     def _load_features(self, clip: dict, tr_idx: int) -> np.ndarray:
-        """Load and concatenate features across a temporal window."""
+        """Load and concatenate features across a temporal window.
+
+        Alignment follows the challenge baseline convention:
+        For fMRI sample `s` (in usable space), the corresponding feature
+        index is:  feat_idx = s + excl_start - hrf_delay
+
+        The temporal window then covers:
+          [feat_idx - window_size + 1, feat_idx]
+        """
         feat_parts = []
-        
-        start_idx = tr_idx - self.window_size + 1
+
+        # Map from usable fMRI index → raw feature index with HRF delay
+        feat_center = tr_idx + self.excl_start - self.hrf_delay
+        # Clamp to valid range (at least 0)
+        feat_center = max(feat_center, 0)
+
+        # Window: [feat_center - window_size + 1, feat_center]
+        start_idx = feat_center - self.window_size + 1
         valid_start = max(0, start_idx)
-        
+
         for mod_name, mod_cfg in self.modality_configs.items():
             path = clip["feat_paths"].get(mod_name)
             dim = mod_cfg["dim"]
-            
+
             if path is None:
                 feat_parts.append(np.zeros((self.window_size, dim), dtype=np.float32))
                 continue
-                
+
             if self.cache_in_memory and str(path) in self._feat_cache:
                 feat_arr = self._feat_cache[str(path)]
             else:
                 feat_arr = np.load(path, mmap_mode='r')
             feat_T = feat_arr.shape[0]
-            
-            valid_end = min(tr_idx + 1, feat_T)
+
+            valid_end = min(feat_center + 1, feat_T)
             actual_valid_start = min(valid_start, feat_T)
-            
+
             if actual_valid_start >= valid_end:
                 feat_parts.append(np.zeros((self.window_size, dim), dtype=np.float32))
                 continue
-            
+
             feat_slice = feat_arr[actual_valid_start:valid_end].astype(np.float32)
-            
-            # Xử lý trường hợp mảng numpy có dạng (1, T, D) hoặc (T, 1, D) thay vì (T, D)
+
+            # Handle (1, T, D) or (T, 1, D) shaped arrays
             if mod_cfg.get("needs_squeeze", False) and feat_slice.ndim > 2:
-                # Nếu pooling script chưa squeeze được hoàn toàn thì squeeze
                 feat_slice = feat_slice.reshape(-1, dim)
-            
-            # Xử lý avg pool cho modality có spatial tokens (e.g. dinov2_giant: T, 4, 1536)
+
+            # Avg pool for modalities with spatial tokens (e.g. dinov2_giant: T, 4, 1536)
             if mod_cfg.get("needs_avg_pool", False) and feat_slice.ndim > 2:
                 feat_slice = feat_slice.mean(axis=1)  # (T, S, D) → (T, D)
-                
+
             valid_L = valid_end - actual_valid_start
             feat = feat_slice.reshape(valid_L, dim)
-            
+
             # We need exact window_size output
             pad_start = actual_valid_start - start_idx
-            
+
             out_feat = np.zeros((self.window_size, dim), dtype=np.float32)
             out_feat[pad_start:pad_start + valid_L] = feat
-            
+
             feat_parts.append(out_feat)
-                
+
         # Concatenate along feature dimension
         return np.concatenate(feat_parts, axis=-1)
 
@@ -387,7 +421,11 @@ class FlowMatchingDataset(Dataset):
     # Normalization
     # ------------------------------------------------------------------
     def _compute_fmri_stats(self):
-        """Compute per-parcel mean and std across all TRs in this dataset."""
+        """Compute per-parcel mean and std across all *usable* TRs.
+
+        Only includes TRs in the range [excl_start, excl_start + n_trs)
+        to match what __getitem__ actually returns.
+        """
         logger.info(f"Computing fMRI normalization stats for {self.subject}/{self.split}...")
 
         # Accumulate online (Welford's algorithm) to avoid loading everything
@@ -398,7 +436,10 @@ class FlowMatchingDataset(Dataset):
         for clip in self.clips:
             with h5py.File(clip["fmri_path"], "r") as fh:
                 for key in clip["fmri_keys"]:
-                    data = fh[key][: clip["n_trs"]].astype(np.float64)
+                    # Only read usable range: [excl_start, excl_start + n_trs)
+                    raw_start = self.excl_start
+                    raw_end = raw_start + clip["n_trs"]
+                    data = fh[key][raw_start:raw_end].astype(np.float64)
                     for row in data:
                         n += 1
                         delta = row - mean
