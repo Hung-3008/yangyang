@@ -1,432 +1,252 @@
 """
-Training Loop for Conditional Flow Matching (v3 — U-ViT).
-Changes vs v2:
-  - U-ViT 1D replaces DiT as velocity network (long skip connections)
-  - HierarchicalFusionEncoder replaces flat FusionEncoder (multi-level Q-Former)
-  - EMA + CFG retained from v2
-  - python -m src.train --subject sub-01
+Conditional Flow Matching: Video → fMRI Generation
+
+Training:
+    x_t = t·x_1 + (1-t)·x_0          (linear interpolation)
+    u_t = x_1 - x_0                    (target velocity)
+    L   = E[‖v_θ(x_t, t, C) - u_t‖²]  (MSE loss)
+
+Inference (Euler ODE):
+    x_{t+Δt} = x_t + Δt · v_θ(x_t, t, C)
+
+Run: python -m src.train --subject sub-01
 """
 
-import gc
-import os
-import sys
 import argparse
+import csv
+import gc
+import logging
 import yaml
-import time
 from pathlib import Path
 from tqdm import tqdm
-import logging
+
+import torch
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from src.data.datamodule import SubjectDataModule
+from src.models import FusionEncoder, UViT1D
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-import torch
-import torch.nn as nn
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-import csv
 
-# Integrate original torchcfm library
-repo_root = Path(__file__).resolve().parent.parent
-sys.path.append(str(repo_root / "conditional-flow-matching"))
-from torchcfm.conditional_flow_matching import ExactOptimalTransportConditionalFlowMatcher
-
-# Custom imports
-from src.data.datamodule import SubjectDataModule
-from src.models import FusionEncoder
-from src.models.uvit1d import UViT1D
-from src.utils.ema import EMAModel
-
-
-class FlowMatchingTrainer:
-    def __init__(self, subject: str, config_path: str = "src/configs/configs.yml", 
+class Trainer:
+    def __init__(self, subject: str, config_path: str = "src/configs/configs.yml",
                  fast_dev_run: bool = False):
         self.subject = subject
         self.fast_dev_run = fast_dev_run
-        
-        with open(config_path, "r") as f:
+
+        with open(config_path) as f:
             self.config = yaml.safe_load(f)
-            
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # CFG config
-        cfg_config = self.config.get("cfg", {})
-        self.cfg_enabled = cfg_config.get("enabled", False)
-        self.cond_drop_prob = cfg_config.get("cond_drop_prob", 0.15)
-        self.guidance_scale = cfg_config.get("guidance_scale", 2.0)
-        
-        # Auxiliary loss weight
-        self.aux_loss_weight = self.config["fusion_encoder"].get("aux_loss_weight", 0.0)
-        
-        if self.cfg_enabled:
-            logger.info(f"CFG enabled: drop_prob={self.cond_drop_prob}, guidance_scale={self.guidance_scale}")
-        
+        torch.manual_seed(self.config["training"].get("seed", 42))
+
         self._setup_data()
         self._setup_models()
-        self._setup_flow_matcher()
         self._setup_optimizer()
-        self._setup_ema()
-        
-        # Create save dir in advance
-        self.save_dir = Path(self.config["training"]["save_dir"]) / self.subject
+
+        self.save_dir = Path(self.config["training"]["save_dir"]) / subject
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.history_file = self.save_dir / "history.csv"
 
+    # ── Data ──────────────────────────────────────────────────────────
     def _setup_data(self):
-        logger.info(f"Setting up dataset for {self.subject}...")
         self.datamodule = SubjectDataModule(
-            subject=self.subject, 
-            config_path="src/configs/configs.yml"
+            subject=self.subject, config_path="src/configs/configs.yml"
         )
         self.datamodule.setup()
         self.train_dl = self.datamodule.train_dataloader()
         self.val_dl = self.datamodule.val_dataloader()
 
+    # ── Models ────────────────────────────────────────────────────────
     def _setup_models(self):
-        logger.info("Initializing Fusion Encoder (BiGRU) and U-ViT 1D...")
         enc_cfg = self.config["fusion_encoder"]
-        
-        # Extract per-modality dimensions from config (order matters!)
-        modality_names = list(self.config["modalities"].keys())
         modality_dims = [cfg["dim"] for cfg in self.config["modalities"].values()]
-        logger.info(f"  {len(modality_dims)} modalities: {modality_names}")
-        logger.info(f"  Dims: {modality_dims} (total={sum(modality_dims)})")
-        
-        self.fusion_encoder = FusionEncoder(
+
+        self.encoder = FusionEncoder(
             modality_dims=modality_dims,
             d_model=enc_cfg["d_model"],
-            d_proj=enc_cfg.get("d_proj", 256),
-            d_hidden=enc_cfg.get("d_hidden", 256),
+            num_queries=enc_cfg["num_queries"],
             dropout=enc_cfg["dropout"],
         ).to(self.device)
-        
-        # Condition tokens = one per modality
-        num_cond_tokens = len(modality_dims)
-        
+
         uvit_cfg = self.config["uvit"]
-        self.uvit = UViT1D(
+        self.velocity_net = UViT1D(
             in_features=self.config["data"]["fmri_dim"],
             patch_size=uvit_cfg["patch_size"],
             embed_dim=uvit_cfg["embed_dim"],
             depth=uvit_cfg["depth"],
             num_heads=uvit_cfg["num_heads"],
             mlp_ratio=uvit_cfg["mlp_ratio"],
-            qkv_bias=uvit_cfg.get("qkv_bias", True),
             drop_rate=uvit_cfg["drop_rate"],
-            num_cond_tokens=num_cond_tokens,
-            skip=uvit_cfg.get("skip", True),
-            use_checkpoint=uvit_cfg.get("use_checkpoint", False),
         ).to(self.device)
 
-        # Log parameter counts
-        enc_params = sum(p.numel() for p in self.fusion_encoder.parameters())
-        uvit_params = sum(p.numel() for p in self.uvit.parameters())
-        logger.info(f"  Fusion Encoder:  {enc_params/1e6:.1f}M params")
-        logger.info(f"  U-ViT 1D:       {uvit_params/1e6:.1f}M params")
-        logger.info(f"  Total:           {(enc_params + uvit_params)/1e6:.1f}M params")
-        logger.info(f"  Condition tokens: {num_cond_tokens} (= num_modalities)")
-        
-    def _setup_flow_matcher(self):
-        sigma = self.config["flow_matching"].get("sigma", 0.0)
-        self.flow_matcher = ExactOptimalTransportConditionalFlowMatcher(sigma=sigma)
-        self.criterion = nn.MSELoss()
-        
+        enc_p = sum(p.numel() for p in self.encoder.parameters())
+        vel_p = sum(p.numel() for p in self.velocity_net.parameters())
+        logger.info(f"Encoder: {enc_p/1e6:.1f}M  Velocity: {vel_p/1e6:.1f}M  Total: {(enc_p+vel_p)/1e6:.1f}M")
+
+    # ── Optimizer ─────────────────────────────────────────────────────
     def _setup_optimizer(self):
-        train_cfg = self.config["training"]
-        self.epochs = train_cfg["epochs"]
-        
-        # Optimize both models simultaneously
-        params = list(self.fusion_encoder.parameters()) + list(self.uvit.parameters())
+        cfg = self.config["training"]
+        self.epochs = cfg["epochs"]
+        self.all_params = list(self.encoder.parameters()) + list(self.velocity_net.parameters())
         self.optimizer = AdamW(
-            params, 
-            lr=float(train_cfg["learning_rate"]), 
-            weight_decay=float(train_cfg["weight_decay"])
+            self.all_params,
+            lr=float(cfg["learning_rate"]),
+            weight_decay=float(cfg["weight_decay"]),
         )
-        # Warmup for first 5 epochs then cosine decay
-        warmup_epochs = 5
-        self.warmup_scheduler = LinearLR(
-            self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
-        )
-        self.cosine_scheduler = CosineAnnealingLR(
-            self.optimizer, T_max=self.epochs - warmup_epochs
-        )
-        self.scheduler = SequentialLR(
-            self.optimizer,
-            schedulers=[self.warmup_scheduler, self.cosine_scheduler],
-            milestones=[warmup_epochs]
-        )
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=self.epochs)
 
-    def _setup_ema(self):
-        """Initialize EMA if enabled in config."""
-        ema_cfg = self.config.get("ema", {})
-        self.ema_enabled = ema_cfg.get("enabled", False)
-        
-        if self.ema_enabled:
-            self.ema = EMAModel(
-                models=[self.fusion_encoder, self.uvit],
-                decay=ema_cfg.get("decay", 0.999),
-                warmup_steps=ema_cfg.get("warmup_steps", 1000),
-            )
-            logger.info(f"EMA enabled: decay={ema_cfg.get('decay', 0.999)}, warmup={ema_cfg.get('warmup_steps', 1000)} steps")
-        else:
-            self.ema = None
-
-    def _apply_cfg_dropout(self, C: torch.Tensor) -> torch.Tensor:
-        """Randomly drop condition tokens for CFG training.
-        
-        With probability `cond_drop_prob`, replace the entire condition
-        tensor with zeros for a sample in the batch. This teaches the model
-        to generate unconditionally (null condition = zeros).
-        
-        Args:
-            C: Condition tensor from Fusion Encoder, shape (B, num_cond_tokens, d_model)
-            
-        Returns:
-            C with some samples zeroed out
-        """
-        if not self.cfg_enabled or not self.fusion_encoder.training:
-            return C
-        
-        B = C.size(0)
-        # Create mask: 1 = keep condition, 0 = drop condition
-        drop_mask = torch.rand(B, device=C.device) > self.cond_drop_prob  # (B,)
-        drop_mask = drop_mask.float().unsqueeze(1).unsqueeze(2)  # (B, 1, 1) for broadcasting
-        
-        return C * drop_mask
-
-    def train_step(self, batch):
+    # ── Train step ────────────────────────────────────────────────────
+    def train_step(self, batch) -> float:
         self.optimizer.zero_grad()
-        
-        # 1. Load Data
-        x1 = batch["x1"].to(self.device)                   # (B, 1000)
-        condition = batch["condition"].to(self.device)     # (B, 31, 22144)
-        
-        # 2. Noise Generation
-        x0 = torch.randn_like(x1) # (B, 1000)
-        
-        # 3. Encode condition → (B, 31, 768) one token per frame
-        C = self.fusion_encoder(condition)
-        
-        # 4. CFG: Randomly drop condition for some samples
-        C = self._apply_cfg_dropout(C)
 
-        # 5. Sample from OT Flow Matching to get t, xt, and target vector field ut
-        t, xt, ut, _, C_shuffled = self.flow_matcher.guided_sample_location_and_conditional_flow(
-            x0, x1, y1=C
-        )
-        
-        # 6. Predict velocity using U-ViT
-        vt_pred = self.uvit(xt, t, C_shuffled)
-        
-        # 7. Loss
-        loss = self.criterion(vt_pred, ut)
-        
+        x1 = batch["x1"].to(self.device)                      # (B, fmri_dim)
+        condition = batch["condition"].to(self.device)         # (B, T, feat_dim)
+
+        C = self.encoder(condition)                            # (B, N_cond, d_model)
+
+        B = x1.size(0)
+        x0 = torch.randn_like(x1)                             # (B, fmri_dim)
+        t = torch.rand(B, device=self.device)                  # (B,)
+
+        # x_t = t·x1 + (1-t)·x0
+        t_ = t.unsqueeze(1)
+        x_t = t_ * x1 + (1.0 - t_) * x0
+
+        # u_t = x1 - x0
+        u_t = x1 - x0
+
+        # Predict velocity
+        v_t = self.velocity_net(x_t, t, C)
+
+        loss = F.mse_loss(v_t, u_t)
         loss.backward()
-        
-        # Gradient Clipping to prevent exploding gradients.
-        enc_grad_norm = torch.nn.utils.clip_grad_norm_(self.fusion_encoder.parameters(), 1.0)
-        uvit_grad_norm = torch.nn.utils.clip_grad_norm_(self.uvit.parameters(), 1.0)
-        
+
+        torch.nn.utils.clip_grad_norm_(self.all_params, max_norm=1.0)
         self.optimizer.step()
-        
-        # 8. EMA update (after optimizer step)
-        if self.ema is not None:
-            self.ema.update()
-        
-        return loss.item(), enc_grad_norm.item(), uvit_grad_norm.item()
 
-    def train(self):
-        log_freq = self.config["training"].get("log_freq", 50)
-        
-        # Init CSV (always overwrite to ensure correct header)
-        if not self.fast_dev_run:
-            with open(self.history_file, mode='w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["epoch", "train_loss", "val_loss", "val_pcc", "lr"])
-        
-        logger.info(f"Starting training on device: {self.device}")
-        
-        best_pcc = -1.0
-        
-        for epoch in range(1, self.epochs + 1):
-            self.fusion_encoder.train()
-            self.uvit.train()
-            
-            pbar = tqdm(self.train_dl, desc=f"Epoch {epoch}/{self.epochs}")
-            epoch_loss = 0.0
-            
-            for step, batch in enumerate(pbar):
-                loss, enc_gn, uvit_gn = self.train_step(batch)
-                epoch_loss += loss
-                
-                # Log Progress with gradient norms
-                if step % log_freq == 0:
-                    pbar.set_postfix({
-                        "Loss": f"{loss:.4f}",
-                        "EncGN": f"{enc_gn:.2f}",
-                        "UViTGN": f"{uvit_gn:.2f}",
-                        "LR": f"{self.scheduler.get_last_lr()[0]:.2e}"
-                    })
-                
-                if self.fast_dev_run and step >= 5: # Fast run a few steps for debugging
-                    break
-                    
-            avg_train_loss = epoch_loss / len(self.train_dl)
-            
-            # Validation every N epochs
-            val_every = self.config["training"].get("val_every", 5)
-            if epoch % val_every == 0 or epoch == self.epochs:
-                val_loss, val_pcc = self.validate()
-                
-                # Free validation memory immediately
-                gc.collect()
-                torch.cuda.empty_cache()
-                
-                logger.info(
-                    f"[Epoch {epoch}] Loss: {avg_train_loss:.4f} | "
-                    f"Val Loss: {val_loss:.4f} | Val PCC: {val_pcc:.4f}"
-                )
-                
-                # Log to CSV only after validation
-                if not self.fast_dev_run:
-                    with open(self.history_file, mode='a', newline='') as f:
-                        writer = csv.writer(f)
-                        writer.writerow([epoch, avg_train_loss, val_loss, val_pcc, self.scheduler.get_last_lr()[0]])
-                
-                # Save best model (only after validation)
-                if not self.fast_dev_run and val_pcc > best_pcc:
-                    best_pcc = val_pcc
-                    self._save_checkpoint(epoch, val_loss, val_pcc, tag="best")
-                    logger.info(f"  ★ New best PCC: {val_pcc:.4f}")
-            else:
-                logger.info(f"[Epoch {epoch}] Loss: {avg_train_loss:.4f} | Val (Skipped)")
-            
-            self.scheduler.step()
-            
-            # Save latest checkpoint every 10 epochs (reduces I/O and memory pressure)
-            if not self.fast_dev_run and epoch % 10 == 0:
-                self._save_checkpoint(epoch, avg_train_loss, best_pcc, tag="latest")
-                
-            if self.fast_dev_run:
-                break
-                
-        logger.info("Training Complete!")
+        return loss.item()
 
-    def _save_checkpoint(self, epoch, val_loss, val_pcc, tag="latest"):
-        """Save checkpoint including EMA state."""
-        ckpt = {
-            "epoch": epoch,
-            "fusion_encoder": self.fusion_encoder.state_dict(),
-            "uvit": self.uvit.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
-            "val_loss": val_loss,
-            "val_pcc": val_pcc,
-        }
-        if self.ema is not None:
-            ckpt["ema"] = self.ema.state_dict()
-        
-        torch.save(ckpt, self.save_dir / f"checkpoint_{tag}.pt")
-
+    # ── Validation ────────────────────────────────────────────────────
     @torch.no_grad()
     def validate(self):
-        """Validate using EMA weights (if enabled) and CFG inference."""
-        self.fusion_encoder.eval()
-        self.uvit.eval()
-        
-        # Use EMA weights for validation if available
-        ema_ctx = self.ema.apply() if self.ema is not None else _nullcontext()
-        
-        with ema_ctx:
-            val_loss, val_pcc = self._run_validation()
-        
-        return val_loss, val_pcc
-    
-    def _run_validation(self):
-        """Core validation logic, separated for EMA context usage."""
-        val_loss = 0.0
-        num_batches = 0
-        
-        all_x1 = []
-        all_pred = []
-        
-        for step, batch in enumerate(self.val_dl):
+        self.encoder.eval()
+        self.velocity_net.eval()
+
+        ode_steps = self.config["training"].get("ode_steps", 50)
+        dt = 1.0 / ode_steps
+
+        val_loss_sum = 0.0
+        all_x1, all_pred = [], []
+
+        for batch in self.val_dl:
             x1 = batch["x1"].to(self.device)
             condition = batch["condition"].to(self.device)
+            C = self.encoder(condition)
+            B = x1.size(0)
+
+            # ── Validation loss (same CFM objective) ──
             x0 = torch.randn_like(x1)
-            
-            # 1. Validation Loss on flow matching
-            C = self.fusion_encoder(condition)
-            t, xt, ut, _, C_shuffled = self.flow_matcher.guided_sample_location_and_conditional_flow(
-                x0, x1, y1=C
-            )
-            vt_pred = self.uvit(xt, t, C_shuffled)
-            
-            loss = self.criterion(vt_pred, ut)
-            val_loss += loss.item()
-            
-            # 2. ODE Solver with CFG for Generation & PCC computation
-            x_pred = x0.clone()
-            steps = 10
-            dt = 1.0 / steps
-            
-            for st in range(steps):
-                t_val = torch.full((x0.size(0),), st * dt, device=self.device)
-                
-                if self.cfg_enabled:
-                    # CFG inference: v_guided = v_uncond + w * (v_cond - v_uncond)
-                    # Sequential passes to avoid doubling batch size (OOM-safe)
-                    null_C = torch.zeros_like(C)
-                    v_uncond = self.uvit(x_pred, t_val, null_C)
-                    v_cond = self.uvit(x_pred, t_val, C)
-                    
-                    v_guided = v_uncond + self.guidance_scale * (v_cond - v_uncond)
-                    x_pred = x_pred + v_guided * dt
-                else:
-                    v_pred = self.uvit(x_pred, t_val, C)
-                    x_pred = x_pred + v_pred * dt
-                
+            t = torch.rand(B, device=self.device)
+            t_ = t.unsqueeze(1)
+            x_t = t_ * x1 + (1.0 - t_) * x0
+            u_t = x1 - x0
+            v_t = self.velocity_net(x_t, t, C)
+            val_loss_sum += F.mse_loss(v_t, u_t).item()
+
+            # ── Generate fMRI via Euler ODE solver ──
+            x = torch.randn(B, x1.size(1), device=self.device)
+            for i in range(ode_steps):
+                t_i = torch.full((B,), i * dt, device=self.device)
+                x = x + self.velocity_net(x, t_i, C) * dt
+
             all_x1.append(x1.cpu())
-            all_pred.append(x_pred.cpu())
-            
-            num_batches += 1
-            if self.fast_dev_run and step >= 2:
+            all_pred.append(x.cpu())
+
+        val_loss = val_loss_sum / len(self.val_dl)
+        val_pcc = self._pearson_corrcoef(torch.cat(all_x1), torch.cat(all_pred))
+
+        self.encoder.train()
+        self.velocity_net.train()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return val_loss, val_pcc
+
+    @staticmethod
+    def _pearson_corrcoef(x: torch.Tensor, y: torch.Tensor) -> float:
+        """Mean per-sample Pearson correlation."""
+        vx = x - x.mean(dim=1, keepdim=True)
+        vy = y - y.mean(dim=1, keepdim=True)
+        r = (vx * vy).sum(dim=1) / (vx.norm(dim=1) * vy.norm(dim=1) + 1e-8)
+        return r.mean().item()
+
+    # ── Main loop ─────────────────────────────────────────────────────
+    def train(self):
+        log_freq = self.config["training"].get("log_freq", 50)
+        val_every = self.config["training"].get("val_every", 5)
+
+        if not self.fast_dev_run:
+            with open(self.history_file, "w", newline="") as f:
+                csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "val_pcc", "lr"])
+
+        logger.info(f"Training on {self.device}")
+
+        for epoch in range(1, self.epochs + 1):
+            self.encoder.train()
+            self.velocity_net.train()
+
+            pbar = tqdm(self.train_dl, desc=f"Epoch {epoch}/{self.epochs}")
+            epoch_loss = 0.0
+
+            for step, batch in enumerate(pbar):
+                loss = self.train_step(batch)
+                epoch_loss += loss
+
+                if (step + 1) % log_freq == 0:
+                    pbar.set_postfix(Loss=f"{loss:.4f}", LR=f"{self.scheduler.get_last_lr()[0]:.2e}")
+
+                if self.fast_dev_run and step >= 4:
+                    break
+
+            avg_loss = epoch_loss / max(step + 1, 1)
+
+            # Validate periodically
+            if epoch % val_every == 0 or epoch == self.epochs:
+                val_loss, val_pcc = self.validate()
+                logger.info(f"[Epoch {epoch}] Loss: {avg_loss:.4f} | Val Loss: {val_loss:.4f} | Val PCC: {val_pcc:.4f}")
+
+                if not self.fast_dev_run:
+                    lr = self.scheduler.get_last_lr()[0]
+                    with open(self.history_file, "a", newline="") as f:
+                        csv.writer(f).writerow([epoch, avg_loss, val_loss, val_pcc, lr])
+
+                    torch.save({
+                        "epoch": epoch,
+                        "encoder": self.encoder.state_dict(),
+                        "velocity_net": self.velocity_net.state_dict(),
+                        "optimizer": self.optimizer.state_dict(),
+                        "val_pcc": val_pcc,
+                    }, self.save_dir / "checkpoint.pt")
+            else:
+                logger.info(f"[Epoch {epoch}] Loss: {avg_loss:.4f}")
+
+            self.scheduler.step()
+
+            if self.fast_dev_run:
                 break
-                
-        # 3. Calculate Temporal PCC (per voxel) matching baseline logic
-        all_x1 = torch.cat(all_x1, dim=0)     # Shape: (Total_TRs, 1000)
-        all_pred = torch.cat(all_pred, dim=0) # Shape: (Total_TRs, 1000)
-        
-        x_mean = all_pred.mean(dim=0, keepdim=True)
-        y_mean = all_x1.mean(dim=0, keepdim=True)
-        x_c = all_pred - x_mean
-        y_c = all_x1 - y_mean
-        
-        cov = (x_c * y_c).sum(dim=0)
-        var_x = (x_c**2).sum(dim=0)
-        var_y = (y_c**2).sum(dim=0)
-        pcc = cov / torch.sqrt(var_x * var_y + 1e-8)
-        val_pcc = pcc.mean().item()
-        
-        return val_loss / num_batches, val_pcc
 
-
-class _nullcontext:
-    """Minimal null context manager for Python < 3.10 compatibility."""
-    def __enter__(self):
-        return self
-    def __exit__(self, *args):
-        pass
+        logger.info("Training complete.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train CFM Model for specific Subject")
-    parser.add_argument("--subject", type=str, default="sub-01", help="Subject ID (e.g. sub-01)")
-    parser.add_argument("--fast_dev_run", action="store_true", help="Run 5 steps for debugging")
-    parser.add_argument("--no_wandb", action="store_true", help="Disable W&B Logging")
+    parser = argparse.ArgumentParser(description="Train CFM: Video → fMRI")
+    parser.add_argument("--subject", type=str, default="sub-01")
+    parser.add_argument("--fast_dev_run", action="store_true")
     args = parser.parse_args()
-    
-    trainer = FlowMatchingTrainer(
-        subject=args.subject, 
-        fast_dev_run=args.fast_dev_run
-    )
-    trainer.train()
+
+    Trainer(subject=args.subject, fast_dev_run=args.fast_dev_run).train()

@@ -1,5 +1,5 @@
 # ============================================================
-# Video-to-fMRI Flow Matching — Configuration (U-ViT v2)
+# Video-to-fMRI Conditional Flow Matching
 # ============================================================
 
 data:
@@ -14,90 +14,53 @@ data:
     - "sub-03"
     - "sub-05"
 
-  # fMRI files per split (relative to fmri_dir/{subject}/func/)
   fmri_files:
     friends: "{subject}_task-friends_space-MNI152NLin2009cAsym_atlas-Schaefer18_parcel-1000Par7Net_desc-s123456_bold.h5"
     movie10: "{subject}_task-movie10_space-MNI152NLin2009cAsym_atlas-Schaefer18_parcel-1000Par7Net_bold.h5"
 
   fmri_dim: 1000  # Schaefer 1000 parcels
 
-  # Train/Val split
-  # Train = movie10 (all) + friends s1-s5
-  # Val   = friends s6
-  # Note: s7 has features but NO fMRI data → excluded
+  # Train = movie10 (all) + friends s1-s5, Val = friends s6
   train_seasons: ["s01", "s02", "s03", "s04", "s05"]
   val_seasons: ["s06"]
   train_include_movie10: true
 
-  # Cửa sổ thời gian (window size)
-  # Mỗi fMRI TR sẽ dùng 31 TRs features (30 quá khứ + hiện tại)
-  window_size: 31
-
-  # How to handle fMRI runs: "first", "average", "all"
-  # movie10 has 17 tasks with both run-1 and run-2
+  window_size: 31     # 30 past + current frame
   fmri_run_strategy: "average"
-
-  # Normalize fMRI with z-score per parcel
   normalize_fmri: true
 
 # ============================================================
-# Fusion Encoder (Per-Modality BiGRU Temporal Projection)
+# Fusion Encoder (Per-Modality Q-Former)
 # ============================================================
-# Each modality gets:
-#   1. Linear(dim_i → d_proj)
-#   2. Bidirectional GRU (d_proj → 2×d_hidden)
-#   3. Linear(2×d_hidden → d_model) + LayerNorm + GELU
-# Output: (B, num_modalities, d_model) — one token per modality
 fusion_encoder:
-  d_model: 768              # Must match U-ViT embed_dim
-  d_proj: 256               # Projection dim before GRU
-  d_hidden: 256             # GRU hidden size per direction
-  dropout: 0.2
+  d_model: 768
+  num_queries: 1      # 1 query per modality → 11 condition tokens
+  dropout: 0.1
 
 # ============================================================
-# U-ViT 1D Velocity Network (replaces DiT)
+# U-ViT 1D Velocity Network (AdaLN-Zero + Cross-Attention)
 # ============================================================
-# Token-concat conditioning + long skip connections.
-# Architecture: 4 in_blocks → 1 mid_block → 4 out_blocks (with skip)
 uvit:
-  patch_size: 20            # 1000 parcels → 50 patches
+  patch_size: 20       # 1000 parcels → 50 patches
   embed_dim: 768
-  depth: 8                  # 4 encoder + 1 bottleneck + 4 decoder
+  depth: 8             # 4 encoder + 1 bottleneck + 4 decoder
   num_heads: 12
   mlp_ratio: 4.0
-  qkv_bias: true
-  drop_rate: 0.2
-  skip: true                # Long skip connections (core U-ViT feature)
-  use_checkpoint: false     # Gradient checkpointing (saves ~65% memory)
+  drop_rate: 0.1
 
 # ============================================================
-# Modality configurations
+# Modalities
 # ============================================================
-# Each modality extracts features from different layers.
-# We select ONE representative layer per modality.
-#
-# Naming conventions for feature files:
-#   friends: {modality}/friends/s{N}/friends_s{NN}e{NN}{a|b|c|d}.h5
-#            task_id from filename: strip "friends_" prefix
-#   movie10: {modality}/movie10/{category}/{clip_name}.h5
-#            Llama models use "movie10_" prefix, others don't
-#            task_id: strip "movie10_" prefix if present
-#
-# Feature shapes:
-#   Most: (T, D)
-#   vjepa2: (T, 1, D) → needs squeeze
-# ============================================================
-
 modalities:
   vjepa2_avg_feat:
     layer_key: "encoder.layernorm_avg"
     dim: 1408
-    needs_squeeze: true   # shape (T, 1, D) → (T, D)
+    needs_squeeze: true
 
   whisper:
     layer_key: "layer_norm"
     dim: 1280
-    needs_squeeze: true   # shape (T, 1, D) → (T, D)
+    needs_squeeze: true
 
   InternVL3_14B:
     layer_key: "language_model.model.norm"
@@ -113,7 +76,7 @@ modalities:
     layer_key: "model.layers.15"
     dim: 2048
     needs_squeeze: false
-    movie10_prefix: "movie10_"  # Llama uses "movie10_" prefix in movie10 filenames
+    movie10_prefix: "movie10_"
 
   Llama-3.2-3B:
     layer_key: "model.layers.23"
@@ -140,45 +103,26 @@ modalities:
     layer_key: "norm"
     dim: 1536
     needs_squeeze: false
-    needs_avg_pool: true    # shape (T, 4, 1536) → avg over spatial → (T, 1536)
+    needs_avg_pool: true
 
   vlm2vec_7b:
     layer_key: "model.norm"
     dim: 3584
     needs_squeeze: false
 
-# Total feature dim when concatenating all 11 modalities:
-# 1408 + 1280 + 5120 + 3584 + 2048 + 3072 + 3584 + 2048 + 768 + 1536 + 3584 = 28032
+# Total: 1408+1280+5120+3584+2048+3072+3584+2048+768+1536+3584 = 28032
 
 # ============================================================
-# Training / Flow Matching configuration
+# Training
 # ============================================================
 training:
-  batch_size:  256
+  batch_size: 256
   num_workers: 4
   learning_rate: 1.0e-4
-  weight_decay: 5.0e-3
+  weight_decay: 1.0e-4
   epochs: 300
   seed: 42
   save_dir: "checkpoints"
   log_freq: 50
-  val_every: 5            # Run validation every N epochs
-
-flow_matching:
-  sigma: 0.0              # Deterministic OT path (no noise)
-
-# ============================================================
-# EMA (Exponential Moving Average)
-# ============================================================
-ema:
-  enabled: true
-  decay: 0.999            # Shadow weight update rate
-  warmup_steps: 1000      # Linearly ramp decay during warmup
-
-# ============================================================
-# Classifier-Free Guidance (CFG)
-# ============================================================
-cfg:
-  enabled: true
-  cond_drop_prob: 0.15    # 15% chance to drop condition during training
-  guidance_scale: 2.0     # w for inference: v = v_uncond + w*(v_cond - v_uncond)
+  val_every: 5
+  ode_steps: 50        # Euler steps for inference
