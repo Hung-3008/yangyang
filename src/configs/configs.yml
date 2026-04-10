@@ -35,23 +35,26 @@ data:
   hrf_delay: 3                # ~4.5s hemodynamic delay (3 TRs × 1.49s)
 
 # ============================================================
-# Fusion Encoder (Per-Modality Q-Former)
+# Fusion Encoder (Temporal-Preserving, TRIBEv2-inspired)
 # ============================================================
 fusion_encoder:
-  d_model: 768
-  num_queries: 1      # 1 query per modality → 11 condition tokens
+  d_model: 1024
+  num_encoder_layers: 2   # lightweight temporal Transformer
+  num_heads: 4
   dropout: 0.1
+  modality_dropout: 0.1   # per-modality dropout (training only)
+  temporal_dropout: 0.1   # per-frame dropout (training only)
 
 # ============================================================
-# U-ViT 1D Velocity Network (AdaLN-Zero + Cross-Attention)
+# DiT Velocity Network (AdaLN + Cross-Attention)
 # ============================================================
-uvit:
+dit:
   patch_size: 20       # 1000 parcels → 50 patches
-  embed_dim: 768
-  depth: 8             # 4 encoder + 1 bottleneck + 4 decoder
-  num_heads: 12
-  mlp_ratio: 4.0
-  drop_rate: 0.1
+  hidden_size: 1024
+  depth: 8
+  num_heads: 16        # 1024/16 = 64 per head
+  context_dim: 1024     # must match fusion_encoder.d_model
+  dropout: 0.1
 
 # ============================================================
 # Modalities

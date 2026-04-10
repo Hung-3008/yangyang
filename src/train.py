@@ -26,7 +26,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from src.data.datamodule import SubjectDataModule
-from src.models import FusionEncoder, UViT1D
+from src.models import FusionEncoder, DiTConditional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -69,19 +69,22 @@ class Trainer:
         self.encoder = FusionEncoder(
             modality_dims=modality_dims,
             d_model=enc_cfg["d_model"],
-            num_queries=enc_cfg["num_queries"],
+            num_encoder_layers=enc_cfg.get("num_encoder_layers", 2),
+            num_heads=enc_cfg.get("num_heads", 4),
             dropout=enc_cfg["dropout"],
+            modality_dropout=enc_cfg.get("modality_dropout", 0.1),
+            temporal_dropout=enc_cfg.get("temporal_dropout", 0.1),
         ).to(self.device)
 
-        uvit_cfg = self.config["uvit"]
-        self.velocity_net = UViT1D(
+        dit_cfg = self.config["dit"]
+        self.velocity_net = DiTConditional(
             in_features=self.config["data"]["fmri_dim"],
-            patch_size=uvit_cfg["patch_size"],
-            embed_dim=uvit_cfg["embed_dim"],
-            depth=uvit_cfg["depth"],
-            num_heads=uvit_cfg["num_heads"],
-            mlp_ratio=uvit_cfg["mlp_ratio"],
-            drop_rate=uvit_cfg["drop_rate"],
+            patch_size=dit_cfg["patch_size"],
+            hidden_size=dit_cfg["hidden_size"],
+            depth=dit_cfg["depth"],
+            num_heads=dit_cfg["num_heads"],
+            context_dim=dit_cfg["context_dim"],
+            dropout=dit_cfg["dropout"],
         ).to(self.device)
 
         enc_p = sum(p.numel() for p in self.encoder.parameters())
